@@ -73,8 +73,11 @@ function get_yaml_param(){
 NAME=$0 # Name of the script
 BASE_DIR=$(dirname $0)
 ABS_BASE_DIR=$(get_abs_path ${BASE_DIR})
-# Docker image of blueoil
-DOCKER_IMAGE=$(id -un)_blueoil:local_build
+source "${ABS_BASE_DIR}"/build/env.sh
+# Container type of blueoil
+CONTAINER_TYPE="${BLUEOIL_CONTAINER_TYPE:?}"
+# Container image of blueoil
+CONTAINER_IMAGE="$(cd "${ABS_BASE_DIR}"; cd "$(dirname ${BLUEOIL_CONTAINER_IMAGE:?})"; pwd)"/"$(basename "${BLUEOIL_CONTAINER_IMAGE:?}")"
 # Argument of path for docker needs to be absolute path.
 GUEST_HOME_DIR="/home/blueoil"
 GUEST_CONFIG_DIR="${GUEST_HOME_DIR}/config"
@@ -84,17 +87,72 @@ GUEST_OUTPUT_DIR="${GUEST_HOME_DIR}/saved"
 USER_ID=$(id -u)
 GROUP_ID=$(id -g)
 # Shared docker options
-PYHONPATHS="-e PYTHONPATH=/home/blueoil:/home/blueoil/lmnet:/home/blueoil/dlk/python/dlk"
-SHARED_DOCKER_OPTIONS="--rm -t -u ${USER_ID}:${GROUP_ID} ${PYHONPATHS}"
+PYTHONPATHS="PYTHONPATH=/home/blueoil:/home/blueoil/lmnet:/home/blueoil/dlk/python/dlk"
+
+INTERACTIVE=()
+NVIDIA=()
+VOLUMES=()
+ENVS=("${PYTHONPATHS}")
+
+if [ "${CONTAINER_TYPE}" == docker ]; then
+
+	function enable_interactive(){
+		INTERACTIVE=(-i)
+	}
+
+	function enable_nvidia(){
+		NVIDIA=(--runtime=nvidia)
+	}
+
+	function add_volumes(){
+		local v
+		for v in "$@"; do
+			VOLUMES=("${VOLUMES[@]}" -v "${v}")
+		done
+	}
+
+	function add_envs(){
+		ENVS=("${ENVS[@]}" "$@")
+	}
+
+	function run(){
+		docker run --rm -t -u "${USER_ID}":"${GROUP_ID}" "${INTERACTIVE[@]}" "${NVIDIA[@]}" "${VOLUMES[@]}" "${CONTAINER_IMAGE}" env "${ENVS[@]}" "$@"
+	}
+
+elif [ "${CONTAINER_TYPE}" == singularity ]; then
+
+	function enable_interactive(){
+		INTERACTIVE=()
+	}
+
+	function enable_nvidia(){
+		NVIDIA=(--nv)
+	}
+
+	function add_volumes(){
+		local v
+		for v in "$@"; do
+			VOLUMES=("${VOLUMES[@]}" -B "${v}")
+		done
+	}
+
+	function add_envs(){
+		ENVS=("${ENVS[@]}" "$@")
+	}
+
+	function run(){
+		singularity exec -e --pwd "${GUEST_HOME_DIR}" "${INTERACTIVE[@]}" "${NVIDIA[@]}" "${VOLUMES[@]}" "${CONTAINER_IMAGE}" env "${ENVS[@]}" "$@"
+	}
+fi
 
 function blueoil_init(){
 	CONFIG_DIR=${ABS_BASE_DIR}/config
 	create_directory ${CONFIG_DIR}
 
 	echo "#### Generate config ####"
-	docker run ${SHARED_DOCKER_OPTIONS} -i \
-		-v ${CONFIG_DIR}:${GUEST_CONFIG_DIR} ${DOCKER_IMAGE} \
-		/bin/bash -c \
+	enable_interactive
+	add_volumes "${CONFIG_DIR}":"${GUEST_CONFIG_DIR}"
+	run /bin/bash -c \
 		"python blueoil/blueoil_init.py && mv *.yml ${GUEST_CONFIG_DIR}"
 	error_exit $? "Failed to generate config"
 
@@ -128,12 +186,16 @@ function set_variables_from_config(){
 }
 
 function set_lmnet_docker_options(){
-	LMNET_DOCKER_OPTIONS="${SHARED_DOCKER_OPTIONS} --runtime=nvidia \
-		-v ${CONFIG_DIR}:${GUEST_CONFIG_DIR} \
-		-v ${DATASET_ABS_DIR}:${DATASET_ABS_DIR} -e DATA_DIR=${GUEST_DATA_DIR} \
-		-v ${VALIDATION_DATASET_ABS_DIR}:${VALIDATION_DATASET_ABS_DIR} \
-		-v ${OUTPUT_DIR}:${GUEST_OUTPUT_DIR} -e OUTPUT_DIR=${GUEST_OUTPUT_DIR} \
-		-e CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}"
+	enable_nvidia
+	add_volumes \
+		"${CONFIG_DIR}":"${GUEST_CONFIG_DIR}" \
+		"${DATASET_ABS_DIR}":"${DATASET_ABS_DIR}" \
+		"${VALIDATION_DATASET_ABS_DIR}":"${VALIDATION_DATASET_ABS_DIR}" \
+		"${OUTPUT_DIR}":"${GUEST_OUTPUT_DIR}"
+	add_envs \
+		DATA_DIR="${GUEST_DATA_DIR}" \
+		OUTPUT_DIR="${GUEST_OUTPUT_DIR}" \
+		CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 }
 
 function blueoil_train(){
@@ -151,8 +213,7 @@ function blueoil_train(){
 
 	echo "#### Run training (${EXPERIMENT_ID}) ####"
 
-	docker run ${LMNET_DOCKER_OPTIONS} ${DOCKER_IMAGE} \
-		python blueoil/blueoil_train.py -c ${GUEST_CONFIG_DIR}/${YML_CONFIG_FILE_NAME} -i ${EXPERIMENT_ID}
+	run python blueoil/blueoil_train.py -c ${GUEST_CONFIG_DIR}/${YML_CONFIG_FILE_NAME} -i ${EXPERIMENT_ID}
 	error_exit $? "Training exited with a non-zero status"
 
 	if [ ! -f ${OUTPUT_DIR}/${EXPERIMENT_ID}/checkpoints/checkpoint ]; then
@@ -183,8 +244,7 @@ function blueoil_convert(){
 
 	echo "#### Generate output files ####"
 
-	docker run ${LMNET_DOCKER_OPTIONS} ${DOCKER_IMAGE} \
-		python blueoil/blueoil_convert.py -i ${EXPERIMENT_ID} ${RESTORE_OPTION}
+	run python blueoil/blueoil_convert.py -i ${EXPERIMENT_ID} ${RESTORE_OPTION}
 	error_exit $? "Failed to generate output files"
 
 	# Set path for DLK
@@ -205,10 +265,10 @@ function blueoil_predict(){
 	PREDICT_OUTPUT_DIR=$(get_abs_path $3)
 
 	echo "#### Predict from images ####"
-	docker run ${LMNET_DOCKER_OPTIONS} \
-		-v ${PREDICT_INPUT_DIR}:${PREDICT_INPUT_DIR} \
-		-v ${PREDICT_OUTPUT_DIR}:${PREDICT_OUTPUT_DIR} ${DOCKER_IMAGE} \
-		python lmnet/executor/predict.py -in ${PREDICT_INPUT_DIR} -o ${PREDICT_OUTPUT_DIR} -i ${EXPERIMENT_ID} ${RESTORE_OPTION}
+	add_volumes \
+		"${PREDICT_INPUT_DIR}":"${PREDICT_INPUT_DIR}"
+		"${PREDICT_OUTPUT_DIR}":"${PREDICT_OUTPUT_DIR}"
+	run python lmnet/executor/predict.py -in ${PREDICT_INPUT_DIR} -o ${PREDICT_OUTPUT_DIR} -i ${EXPERIMENT_ID} ${RESTORE_OPTION}
 	error_exit $? "Failed to predict from images"
 
 	echo "Result files are created: ${PREDICT_OUTPUT_DIR}"
@@ -232,7 +292,7 @@ function blueoil_tensorboard(){
 	docker run ${LMNET_DOCKER_OPTIONS} \
 		-i \
 		-p ${PORT}:${PORT} \
-		${DOCKER_IMAGE} \
+		${CONTAINER_IMAGE} \
 		tensorboard --logdir ${TENSORBOARD_DIR} --host 0.0.0.0 --port ${PORT}
 }
 

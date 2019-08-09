@@ -1,0 +1,58 @@
+#!/bin/bash
+
+#$ -l rt_F=12
+#$ -l h_rt=1:00:00
+#$ -j y
+#$ -cwd
+
+
+source /usr/share/Modules/init/bash
+
+set -eo pipefail
+
+module load python/3.6/3.6.5 cuda/9.0/9.0.176.4 cudnn/7.6/7.6.1 nccl/2.3/2.3.7-1 openmpi/2.1.6
+export LD_LIBRARY_PATH="${CUDA_HOME}"/extras/CUPTI/lib64:"${LD_LIBRARY_PATH}"
+
+if [[ ! -e .venv ]]
+then
+	python3.6 -m venv .venv
+	.venv/bin/pip install -U pip setuptools
+	.venv/bin/pip install -r lmnet/gpu.requirements.txt
+fi
+source .venv/bin/activate
+
+export PYTHONPATH="$(pwd)"/lmnet:"${PYTHONPATH}"
+
+master_host="$(hostname -s)"
+redis_port=6379
+redis_address="${master_host}":"${redis_port}"
+hostlist="$(cat "${SGE_JOB_HOSTLIST}")"
+num_hostlist="$(echo "${hostlist}" | wc -l)"
+worker_hostlist="$(echo "${hostlist}" | grep -v "${master_host}" || true)"
+num_worker_hostlist="$(echo "${worker_hostlist}" | wc -l)"
+
+num_cpus="$(nproc)"
+num_gpus="$(nvidia-smi -L | wc -l)"
+num_threads="$(( (${num_cpus}) / (${num_gpus}) ))"
+max_concurrent="$(( (${num_gpus}) * (${NHOSTS}) ))"
+num_samples="$(( (${max_concurrent}) * 100 ))"
+
+export MKL_NUM_THREADS="${num_threads}"
+export NUMEXPR_NUM_THREADS="${num_threads}"
+export OMP_NUM_THREADS="${num_threads}"
+export OPENBLAS_NUM_THREADS="${num_threads}"
+export VECLIB_MAXIMUM_THREADS="${num_threads}"
+
+ray start --head --redis-port "${redis_port}" --num-cpus "${num_cpus}" --num-gpus "${num_gpus}"
+while IFS= read -r worker_host <&3 || [ -n "${worker_host}" ]
+do
+	mpiexec --np 1 --host "${worker_host}" ray start --redis-address "${redis_address}" --num-cpus "${num_cpus}" --num-gpus "${num_gpus}"
+done 3< <(echo "${worker_hostlist}")
+
+python -m executor.tune_ray --config-file lmnet/configs/core/object_detection/lm_fyolo_quantize_widerface_tune.py --redis-address "${redis_address}" --num-cpus "${num_cpus}" --num-gpus "${num_gpus}" --max-concurrent "${max_concurrent}" --num-samples="${num_samples}"
+
+ray stop
+while IFS= read -r worker_host <&3 || [[ -n "${worker_host}" ]]
+do
+	mpiexec --np 1 --host "${worker_host}" ray stop
+done 3< <(echo "${worker_hostlist}")

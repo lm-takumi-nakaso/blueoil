@@ -91,12 +91,15 @@ def _xorshift32(r):
 
 
 class _MultiProcessDatasetPrefetchThread(threading.Thread):
-    def __init__(self, dataset, result_queue, seed):
+    def __init__(self, dataset, result_queue, seed, processes=None):
         super().__init__()
         # TODO(tokunaga): the number of processes should be configurable
         self.seed = seed + 1  # seed must not be 0 because using xorshift32.
         self.support_getitem = hasattr(dataset, "__getitem__")
-        self.pool = Pool(processes=8, initializer=_prefetch_setup,
+        if processes is None:
+            processes = 8
+        self.processes = processes
+        self.pool = Pool(processes=self.processes, initializer=_prefetch_setup,
                          initargs=(dataset, self.seed, not self.support_getitem))
         self.result_queue = result_queue
         self.batch_size = dataset.batch_size
@@ -132,7 +135,7 @@ class _MultiProcessDatasetPrefetchThread(threading.Thread):
     def refresh_pool(self):
         self.pool.close()
         self.seed += 1
-        self.pool = Pool(processes=8, initializer=_prefetch_setup,
+        self.pool = Pool(processes=self.processes, initializer=_prefetch_setup,
                          initargs=(self.dataset, self.seed, not self.support_getitem))
 
     def loop_body(self):
@@ -240,7 +243,7 @@ class DatasetIterator:
         else:
             if self.enable_prefetch:
                 self.prefetch_result_queue = queue.Queue(maxsize=200)
-                self.prefetcher = _MultiProcessDatasetPrefetchThread(self.dataset, self.prefetch_result_queue, seed)
+                self.prefetcher = _MultiProcessDatasetPrefetchThread(self.dataset, self.prefetch_result_queue, seed, processes=self.enable_prefetch)
                 self.prefetcher.start()
                 print("ENABLE prefetch")
             else:

@@ -15,19 +15,27 @@
 # =============================================================================
 import os
 import six
-import math
 import click
 import tensorflow as tf
-import multiprocessing
+from tensorflow.core.util.event_pb2 import SessionLog
+from tensorflow.keras.utils import Progbar
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
+from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime
+from functools import partial
+import sys
+import traceback
 
 from easydict import EasyDict
 from lmnet.utils import executor, config as config_util
 from lmnet.datasets.dataset_iterator import DatasetIterator
 
 import ray
-from ray.tune import run_experiments, register_trainable, Trainable
+from ray.tune import run_experiments, Trainable, Experiment
 from ray.tune.schedulers import AsyncHyperBandScheduler
-from ray.tune.suggest import HyperOptSearch
+from ray.tune.suggest.hyperopt import HyperOptSearch
+from ray.tune.logger import DEFAULT_LOGGERS, TFLogger
+from ray.tune.result import EPISODE_REWARD_MEAN, TRAINING_ITERATION
 
 if six.PY2:
     import subprocess32 as subprocess
@@ -102,153 +110,217 @@ def get_best_result(trial_list, metric, param):
             param: get_best_trial(trial_list, metric).last_result[param]}
 
 
-def update_parameters_for_each_trial(network_kwargs, chosen_kwargs):
-    """Update selected parameters to the configuration of each trial"""
-    network_kwargs['optimizer_class'] = chosen_kwargs['optimizer_class']['optimizer']
-    for key in list(chosen_kwargs['optimizer_class'].keys()):
-        if key != 'optimizer':
-            network_kwargs['optimizer_kwargs'][key] = chosen_kwargs['optimizer_class'][key]
-    network_kwargs['learning_rate_func'] = chosen_kwargs['learning_rate_func']['scheduler']
-    base_lr = chosen_kwargs['learning_rate']
-    if network_kwargs['learning_rate_func'] is tf.train.piecewise_constant:
-        lr_factor = chosen_kwargs['learning_rate_func']['scheduler_factor']
-        network_kwargs['learning_rate_kwargs']['values'] = [base_lr,
-                                                            base_lr * lr_factor,
-                                                            base_lr * lr_factor * lr_factor,
-                                                            base_lr * lr_factor * lr_factor * lr_factor]
-        network_kwargs['learning_rate_kwargs']['boundaries'] = chosen_kwargs['learning_rate_func']['scheduler_steps']
-    elif network_kwargs['learning_rate_func'] is tf.train.polynomial_decay:
-        network_kwargs['learning_rate_kwargs']['learning_rate'] = base_lr
-        network_kwargs['learning_rate_kwargs']['power'] = chosen_kwargs['learning_rate_func']['scheduler_power']
-        network_kwargs['learning_rate_kwargs']['decay_steps'] = chosen_kwargs['learning_rate_func']['scheduler_decay']
-    else:
-        network_kwargs['learning_rate_kwargs']['learning_rate'] = base_lr
+def save_checkpoint(saver, sess, global_step, step, environment):
+    checkpoint_file = "save.ckpt"
+    saver.save(
+        sess,
+        os.path.join(environment.CHECKPOINT_DIR, checkpoint_file),
+        global_step=global_step,
+    )
 
-    if 'weight_decay_rate' in chosen_kwargs:
-        network_kwargs['weight_decay_rate'] = chosen_kwargs['weight_decay_rate']
-
-    return network_kwargs
+    if step == 0:
+        # check create pb on only first step.
+        minimal_graph = tf.graph_util.convert_variables_to_constants(
+            sess,
+            sess.graph.as_graph_def(add_shapes=True),
+            ["output"],
+        )
+        pb_name = "minimal_graph_with_shape_{}.pb".format(step + 1)
+        pbtxt_name = "minimal_graph_with_shape_{}.pbtxt".format(step + 1)
+        tf.train.write_graph(minimal_graph, environment.CHECKPOINT_DIR, pb_name, as_text=False)
+        tf.train.write_graph(minimal_graph, environment.CHECKPOINT_DIR, pbtxt_name, as_text=True)
 
 
-def setup_dataset(config, subset, rank):
-    """helper function from lmnet/train.py to setup the data iterator"""
-    dataset_class = config.DATASET_CLASS
+def setup_dataset(config, subset, rank, processes):
+    DatasetClass = config.DATASET_CLASS
     dataset_kwargs = dict((key.lower(), val) for key, val in config.DATASET.items())
-    dataset = dataset_class(subset=subset, **dataset_kwargs)
-    # TODO (Neil): Enable both train and validation
-    # For some reasons processes are not terminated cleanly, enable prefetch ONLY for the train dataset.
-    enable_prefetch = dataset_kwargs.pop("enable_prefetch", False) if subset == 'train' else False
-    return DatasetIterator(dataset, seed=rank, enable_prefetch=enable_prefetch)
+    dataset = DatasetClass(subset=subset, **dataset_kwargs)
+    processes = dataset_kwargs.pop("enable_prefetch", False) and processes
+    return DatasetIterator(dataset, seed=rank, enable_prefetch=processes)
 
 
-class TrainTunable(Trainable):
-    """ TrainTunable class interfaces with Ray framework """
-    def _setup(self, config):
-        self.lm_config = config_util.load(self.config['lm_config'])
-        executor.init_logging(self.lm_config)
+def start_training(config, environment, num_cpus, recreate=False, seed=0):
+    config_util.display(config)
+    executor.init_logging(config)
 
-        model_class = self.lm_config.NETWORK_CLASS
-        network_kwargs = dict((key.lower(), val) for key, val in self.lm_config.NETWORK.items())
-        network_kwargs = update_parameters_for_each_trial(network_kwargs, self.config)
+    executor.prepare_dirs(recreate=recreate)
+    config_util.save_yaml(environment.EXPERIMENT_DIR, config)
 
-        # No distributed training was implemented, therefore rank set to 0
-        self.train_dataset = setup_dataset(self.lm_config, "train", 0)
-        self.validation_dataset = setup_dataset(self.lm_config, "validation", 0)
+    ModelClass = config.NETWORK_CLASS
+    network_kwargs = dict((key.lower(), val) for key, val in config.NETWORK.items())
 
-        if model_class.__module__.startswith("lmnet.networks.object_detection"):
-            model = model_class(
-                classes=self.train_dataset.classes,
-                num_max_boxes=self.train_dataset.num_max_boxes,
-                is_debug=self.lm_config.IS_DEBUG,
-                **network_kwargs,
-            )
-        elif model_class.__module__.startswith("lmnet.networks.segmentation"):
-            model = model_class(
-                classes=self.train_dataset.classes,
-                label_colors=self.train_dataset.label_colors,
-                is_debug=self.lm_config.IS_DEBUG,
+    train_dataset = setup_dataset(config, "train", seed, processes=num_cpus-1)
+    print("train dataset num:", train_dataset.num_per_epoch)
+
+    graph = tf.Graph()
+    with graph.as_default():
+        if ModelClass.__module__.startswith("lmnet.networks.object_detection"):
+            model = ModelClass(
+                classes=train_dataset.classes,
+                num_max_boxes=train_dataset.num_max_boxes,
+                is_debug=config.IS_DEBUG,
                 **network_kwargs,
             )
         else:
-            model = model_class(
-                classes=self.train_dataset.classes,
-                is_debug=self.lm_config.IS_DEBUG,
+            model = ModelClass(
+                classes=train_dataset.classes,
+                is_debug=config.IS_DEBUG,
                 **network_kwargs,
             )
 
-        self.global_step = tf.Variable(0, name="global_step", trainable=False)
-        self.is_training_placeholder = tf.placeholder(tf.bool, name="is_training_placeholder")
-        self.images_placeholder, self.labels_placeholder = model.placeholderes()
+        global_step = tf.Variable(0, name="global_step", trainable=False)
+        is_training_placeholder = tf.placeholder(tf.bool, name="is_training_placeholder")
 
-        output = model.inference(self.images_placeholder, self.is_training_placeholder)
-        if model_class.__module__.startswith("lmnet.networks.object_detection"):
-            loss = model.loss(output, self.labels_placeholder, self.is_training_placeholder)
+        images_placeholder, labels_placeholder = model.placeholderes()
+
+        output = model.inference(images_placeholder, is_training_placeholder)
+        if ModelClass.__module__.startswith("lmnet.networks.object_detection"):
+            loss = model.loss(output, labels_placeholder, global_step)
         else:
-            loss = model.loss(output, self.labels_placeholder)
-        opt = model.optimizer(self.global_step)
+            loss = model.loss(output, labels_placeholder)
+        opt = model.optimizer(global_step)
+        train_op = model.train(loss, opt, global_step)
+        metrics_ops_dict, metrics_update_op = model.metrics(output, labels_placeholder)
+        # TODO(wakisaka): Deal with many networks.
+        model.summary(output, labels_placeholder)
 
-        train_op = model.train(loss, opt, self.global_step)
-        metrics_ops_dict, metrics_update_op = model.metrics(output, self.labels_placeholder)
+        summary_op = tf.summary.merge_all()
 
-        self.train_op = train_op
-        self.metrics_ops_dict = metrics_ops_dict
-        self.metrics_update_op = metrics_update_op
+        metrics_summary_op, metrics_placeholders = executor.prepare_metrics(metrics_ops_dict)
 
         init_op = tf.global_variables_initializer()
-        self.reset_metrics_op = tf.local_variables_initializer()
+        reset_metrics_op = tf.local_variables_initializer()
 
-        session_config = tf.ConfigProto(
-            gpu_options=tf.GPUOptions(allow_growth=True))
-        self.sess = tf.Session(config=session_config)
-        self.sess.run([init_op, self.reset_metrics_op])
-        self.iterations = 0
-        self.saver = tf.train.Saver()
+        saver = tf.train.Saver(max_to_keep=None)
+
+        if config.IS_PRETRAIN:
+            all_vars = tf.global_variables()
+            pretrain_var_list = [
+                var for var in all_vars if var.name.startswith(tuple(config.PRETRAIN_VARS))
+            ]
+            print("pretrain_vars", [
+                var.name for var in pretrain_var_list
+            ])
+            pretrain_saver = tf.train.Saver(pretrain_var_list, name="pretrain_saver")
+
+    session_config = tf.ConfigProto(gpu_options=tf.GPUOptions(allow_growth=True))  # tf.ConfigProto(log_device_placement=True)
+    # TODO(wakisaka): XLA JIT
+    # session_config.graph_options.optimizer_options.global_jit_level = tf.OptimizerOptions.ON_1
+
+    sess = tf.Session(graph=graph, config=session_config)
+    sess.run([init_op, reset_metrics_op])
+
+    train_writer = tf.summary.FileWriter(environment.TENSORBOARD_DIR + "/train", sess.graph)
+
+    if config.IS_PRETRAIN:
+        print("------- Load pretrain data ----------")
+        pretrain_saver.restore(sess, os.path.join(config.PRETRAIN_DIR, config.PRETRAIN_FILE))
+        sess.run(tf.assign(global_step, 0))
+
+    last_step = sess.run(global_step)
+
+    # Calculate max steps. The priority of config.MAX_EPOCHS is higher than config.MAX_STEPS.
+    if "MAX_EPOCHS" in config:
+        max_steps = int(train_dataset.num_per_epoch / config.BATCH_SIZE * config.MAX_EPOCHS)
+    else:
+        max_steps = config.MAX_STEPS
+
+    progbar = Progbar(max_steps)
+    progbar.update(last_step)
+    for step in range(last_step, max_steps):
+        images, labels = train_dataset.feed()
+
+        feed_dict = {
+            is_training_placeholder: True,
+            images_placeholder: images,
+            labels_placeholder: labels,
+        }
+        sess.run([train_op], feed_dict=feed_dict)
+
+        to_be_saved = step == 0 or (step + 1) == max_steps or (step + 1) % config.SAVE_STEPS == 0
+
+        if step * ((step + 1) % config.SUMMARISE_STEPS) == 0:
+            # Runtime statistics for develop.
+            # run_options = tf.RunOptions(trace_level=tf.RunOptions.FULL_TRACE)
+            # run_metadata = tf.RunMetadata()
+
+            sess.run(reset_metrics_op)
+            summary, _ = sess.run(
+                [summary_op, metrics_update_op], feed_dict=feed_dict,
+                # options=run_options,
+                # run_metadata=run_metadata,
+            )
+            # train_writer.add_run_metadata(run_metadata, "step: {}".format(step + 1))
+            train_writer.add_summary(summary, step + 1)
+
+            metrics_values = sess.run(list(metrics_ops_dict.values()))
+            metrics_feed_dict = {placeholder: value for placeholder, value in zip(metrics_placeholders, metrics_values)}
+
+            metrics_summary, = sess.run(
+                [metrics_summary_op], feed_dict=metrics_feed_dict,
+            )
+            train_writer.add_summary(metrics_summary, step + 1)
+
+            train_writer.flush()
+
+            metrics_dict = sess.run(metrics_ops_dict)
+            if config.NETWORK_CLASS.__module__.startswith("lmnet.networks.segmentation"):
+                episode_reward_mean = metrics_dict['mean_iou']
+            elif config.NETWORK_CLASS.__module__.startswith("lmnet.networks.object_detection"):
+                episode_reward_mean = metrics_dict['MeanAveragePrecision_0.5']
+            else:
+                episode_reward_mean = metrics_dict['accuracy']
+            yield {**{TRAINING_ITERATION: step + 1}, **{EPISODE_REWARD_MEAN: episode_reward_mean}, **metrics_dict}
+
+        progbar.update(step + 1)
+    # training loop end.
+    print("Done")
+
+
+class Trainer(Trainable):
+    """ TrainTunable class interfaces with Ray framework """
+
+    def _setup(self, config):
+
+        self.__log = open('trial.log', mode='w', buffering=1)
+        self.__start_training = None
 
     def _train(self):
-        step_per_epoch = int(self.train_dataset.num_per_epoch / self.lm_config.BATCH_SIZE)
+        if self.__start_training is None:
+            from lmnet import environment
 
-        for _ in range(step_per_epoch):
-            images, labels = self.train_dataset.feed()
+            environment.EXPERIMENT_DIR = os.path.abspath('.')
+            environment.TENSORBOARD_DIR = os.path.abspath('tensorboard')
+            environment.CHECKPOINTS_DIR = os.path.abspath('checkpoints')
+            environment._init_flag = True
 
-            feed_dict = {
-                self.is_training_placeholder: True,
-                self.images_placeholder: images,
-                self.labels_placeholder: labels,
-            }
+            chosen_kwargs =self.config
+            config_util.save_yaml(os.path.join(environment.EXPERIMENT_DIR, 'trial'), chosen_kwargs)
+            kwargs = config_util.load(chosen_kwargs['lm_config'])
+            config = EasyDict(kwargs['UPDATE_PARAMETERS_FOR_EACH_TRIAL'](kwargs, chosen_kwargs))
+            if config is None:
+                config = kwargs
+            config = EasyDict(config)
 
-            self.sess.run([self.train_op], feed_dict=feed_dict)
+            num_cpus = len(ray.get_resource_ids()['CPU'])
 
-        self.sess.run(self.reset_metrics_op)
-        test_step_size = int(math.ceil(self.validation_dataset.num_per_epoch / self.lm_config.BATCH_SIZE))
-        for _ in range(test_step_size):
-            images, labels = self.validation_dataset.feed()
-            feed_dict = {
-                self.is_training_placeholder: False,
-                self.images_placeholder: images,
-                self.labels_placeholder: labels,
-            }
+            self.__start_training = start_training(config=config, environment=environment, num_cpus=num_cpus)
 
-            self.sess.run([self.metrics_update_op], feed_dict=feed_dict)
+        with redirect_stdout(self.__log), redirect_stderr(self.__log):
+            try:
+                result = next(self.__start_training)
+            except:
+                traceback.print_exc()
+                raise
 
-        if self.lm_config.NETWORK_CLASS.__module__.startswith("lmnet.networks.segmentation"):
-            metric_accuracy = self.sess.run(self.metrics_ops_dict["mean_iou"])
-        else:
-            metric_accuracy = self.sess.run(self.metrics_ops_dict["accuracy"])
+        return result
 
-        self.iterations += 1
-        return {"mean_accuracy": metric_accuracy}
-
-    def _save(self, checkpoint_dir):
-        return self.saver.save(
-            self.sess, checkpoint_dir + "/save", global_step=self.iterations)
-
-    def _restore(self, path):
-        return self.saver.restore(self.sess, path)
+    def _stop(self):
+        os._exit(0)
 
 
-def run(config_file, tunable_id, local_dir):
-    register_trainable(tunable_id, TrainTunable)
-    lm_config = config_util.load(config_file)
+def run_train(config_file, redis_address, num_cpus, num_gpus, log_to_driver, temp_dir, max_concurrent, num_samples):
+    from lmnet.environment import OUTPUT_DIR
 
     def easydict_to_dict(config):
         if isinstance(config, EasyDict):
@@ -261,45 +333,113 @@ def run(config_file, tunable_id, local_dir):
             config[key] = value
         return config
 
-    tune_space = easydict_to_dict(lm_config['TUNE_SPACE'])
-    tune_spec = easydict_to_dict(lm_config['TUNE_SPEC'])
-    tune_spec['run'] = tunable_id
-    tune_spec['config'] = {'lm_config': os.path.join(os.getcwd(), config_file)}
-    tune_spec['local_dir'] = local_dir
-    tune_spec['trial_name_creator'] = ray.tune.function(trial_str_creator)
+    if num_cpus is None:
+        num_cpus = len(os.sched_getaffinity(0))
+    if num_gpus is None:
+        num_gpus = get_num_gpu()
+    if max_concurrent is None:
+        max_concurrent = num_gpus
 
     # Expecting use of gpus to do parameter search
-    ray.init(num_cpus=multiprocessing.cpu_count() // 2, num_gpus=max(get_num_gpu(), 1))
-    algo = HyperOptSearch(tune_space, max_concurrent=4, reward_attr="mean_accuracy")
-    scheduler = AsyncHyperBandScheduler(time_attr="training_iteration", reward_attr="mean_accuracy", max_t=200)
-    trials = run_experiments(experiments={'exp_tune': tune_spec},
-                             search_alg=algo,
-                             scheduler=scheduler)
-    print("The best result is", get_best_result(trials, metric="mean_accuracy", param='config'))
+    if redis_address is not None:
+        ray.init(redis_address=redis_address, log_to_driver=log_to_driver)
+    else:
+        ray.init(num_cpus=num_cpus, num_gpus=num_gpus, temp_dir=temp_dir, log_to_driver=log_to_driver)
+
+    config_file = os.path.abspath(config_file)
+    config_name, _ = os.path.splitext(os.path.basename(config_file))
+    experiment_name = '{}_{:%Y%m%d%H%M%S}'.format(config_name, datetime.now())
+    config = config_util.load(config_file)
+
+    max_steps = config.get('MAX_STEPS', sys.maxsize)
+    save_steps = config.get('SAVE_STEPS', 0)
+    tune_space = config.TUNE_SPACE
+
+    algo = HyperOptSearch(tune_space, max_concurrent=max_concurrent, metric=EPISODE_REWARD_MEAN, mode='max')
+
+    scheduler = AsyncHyperBandScheduler(time_attr=TRAINING_ITERATION, metric=EPISODE_REWARD_MEAN, mode='max', max_t=max_steps)
+
+    tune_spec = {
+        'checkpoint_freq': save_steps,
+        'config': {
+            'lm_config': config_file
+        },
+        'local_dir': OUTPUT_DIR,
+        'loggers': [logger for logger in DEFAULT_LOGGERS if logger != TFLogger],
+        'name': experiment_name,
+        'num_samples': num_samples,
+        'resources_per_trial': {
+            'cpu': num_cpus // num_gpus,
+            'gpu': 1
+        },
+        'run': Trainer,
+        'stop': {
+            TRAINING_ITERATION: max_steps
+        },
+        'trial_name_creator': ray.tune.function(trial_str_creator),
+    }
+
+    trials = ray.tune.run_experiments([Experiment(**tune_spec)], search_alg=algo, scheduler=scheduler)
+    print("The best result is", get_best_result(trials, metric=EPISODE_REWARD_MEAN, param='config'))
 
 
-@click.command(context_settings=dict(help_option_names=['-h', '--help']))
+@click.command('train', context_settings=dict(help_option_names=['-h', '--help']))
 @click.option(
     '-c',
     '--config_file',
+    '--config-file',
     help="config file path for this training",
-    default=os.path.join('configs', 'example.py'),
     required=True,
 )
 @click.option(
-    '-i',
-    '--tunable_id',
-    help='[optional] id of this tuning',
-    default="tunable",
-)
-@click.option(
-    '-s',
-    '--local_dir',
-    help='[optional] result saving directory of training results, defaults in ~/ray_results',
+    '--redis_address',
+    '--redis-address',
+    help='[optional] the address to use for connecting to Redis',
     default=None,
 )
-def main(config_file, tunable_id, local_dir):
-    run(config_file, tunable_id, local_dir)
+@click.option(
+    '--num_cpus',
+    '--num-cpus',
+    help='[optional] the number of CPUs on this node',
+    default=None,
+    type=int
+)
+@click.option(
+    '--num_gpus',
+    '--num-gpus',
+    help='[optional] the number of GPUs on this node',
+    default=None,
+    type=int
+)
+@click.option(
+    '--log_to_driver',
+    '--log-to-driver',
+    help='[optional] If true, then output from all of the worker processes on all nodes will be directed to the driver',
+    default=True,
+    type=int
+)
+@click.option(
+    '--temp_dir',
+    '--temp-dir',
+    help='[optional] If provided, it will specify the root temporary directory for the Ray process',
+    default=False,
+)
+@click.option(
+    '--max_concurrent',
+    '--max-concurrent',
+    help='[optional] Number of maximum concurrent trials',
+    default=None,
+    type=int
+)
+@click.option(
+    '--num_samples',
+    '--num-samples',
+    help='[optional] Number of times to sample from the hyperparameter space',
+    default=sys.maxsize,
+    type=int
+)
+def main(config_file, redis_address, num_cpus, num_gpus, log_to_driver, temp_dir, max_concurrent, num_samples):
+    run_train(config_file, redis_address, num_cpus, num_gpus, log_to_driver, temp_dir, max_concurrent, num_samples)
 
 
 if __name__ == '__main__':

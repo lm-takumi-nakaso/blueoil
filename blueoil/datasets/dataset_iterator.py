@@ -13,23 +13,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # =============================================================================
-import queue
+import collections
+import itertools
+import os
 import threading
-import time
-from multiprocessing import Pool
+import weakref
 
+import loky
 import numpy as np
 import tensorflow as tf
 
 from blueoil.datasets.base import ObjectDetectionBase, SegmentationBase, KeypointDetectionBase
 from blueoil.datasets.tfds import TFDSMixin
 
-_dataset = None
+_dataset_dict = None
 
 
-def _prefetch_setup(dataset):
-    global _dataset
-    _dataset = dataset
+def _prefetch_setup(dataset_dict):
+    global _dataset_dict
+    _dataset_dict = dataset_dict
 
 
 def _apply_augmentations(dataset, image, label):
@@ -71,9 +73,10 @@ def _apply_augmentations(dataset, image, label):
     return (image, label)
 
 
-def _process_one_data(i):
-    image, label = _dataset[i]
-    return _apply_augmentations(_dataset, image, label)
+def _process_one_data(dataset_id, data_id):
+    dataset = _dataset_dict[dataset_id]
+    image, label = dataset[data_id]
+    return _apply_augmentations(dataset, image, label)
 
 
 def _concat_data(data_list):
@@ -90,20 +93,42 @@ def _xorshift32(r):
     return r & 0xFFFFFFFF
 
 
-class _MultiProcessDatasetPrefetchThread(threading.Thread):
-    def __init__(self, dataset, result_queue, seed):
-        super().__init__()
+def _prepare_worker_env(inner_max_num_threads=None):
+    env = {}
+
+    MAX_NUM_THREADS_VARS = [
+        "BLIS_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "NUMBA_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "OMP_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+    ]
+    for var in MAX_NUM_THREADS_VARS:
+        env[var] = str(inner_max_num_threads)
+
+    TBB_ENABLE_IPC_VAR = "ENABLE_IPC"
+    if TBB_ENABLE_IPC_VAR not in os.environ:
+        env[TBB_ENABLE_IPC_VAR] = "1"
+
+    return env
+
+
+class _MultiProcessDatasetReader:
+
+    dataset_weakdict_lock = threading.RLock()
+    dataset_weakdict = weakref.WeakValueDictionary()
+
+    def __init__(self, dataset, seed):
+        with self.dataset_weakdict_lock:
+            self.dataset_weakdict[id(dataset)] = dataset
         # TODO(tokunaga): the number of processes should be configurable
         self.seed = seed + 1  # seed must not be 0 because using xorshift32.
         self.support_getitem = hasattr(dataset, "__getitem__")
-        self.pool = Pool(processes=8, initializer=_prefetch_setup,
-                         initargs=(dataset, ))
-        self.result_queue = result_queue
-        self.batch_size = dataset.batch_size
         self.dataset = dataset
         self.data_ids = []
-        self.terminate = False
-        self.setDaemon(True)
+        self.result_generator = self.run()
 
     def gen_ids(self):
         if hasattr(self.dataset, "__len__"):
@@ -113,59 +138,52 @@ class _MultiProcessDatasetPrefetchThread(threading.Thread):
         return list(range(0, length))
 
     def gen_task(self, task_batch_size):
-        task_list = []
         for i in range(0, task_batch_size):
             if len(self.data_ids) == 0:
                 self.data_ids = self.gen_ids()
                 self.seed = _xorshift32(self.seed)
                 random_state = np.random.RandomState(self.seed)
                 random_state.shuffle(self.data_ids)
-            data_id = self.data_ids.pop()
-            task_list.append(data_id)
-        return task_list
+            yield self.data_ids.pop()
 
     def chunks(self, l, n):
         """Yield successive n-sized chunks from l."""
-        for i in range(0, len(l), n):
-            yield l[i:i + n]
-
-    def refresh_pool(self):
-        self.pool.close()
-        self.seed += 1
-        self.pool = Pool(processes=8, initializer=_prefetch_setup,
-                         initargs=(self.dataset, ))
+        iterator = iter(l)
+        return iter(lambda: list(itertools.islice(iterator, n)), [])
 
     def loop_body(self):
-        task_list = self.gen_task(self.dataset.batch_size * 8)
-        fetch_result = self.pool.map(_process_one_data, task_list)
-        for fetch_result_chunk in self.chunks(fetch_result, self.batch_size):
-            data_batch = _concat_data(fetch_result_chunk)
-            put_ok = False
-            while not put_ok:
-                try:
-                    self.result_queue.put(data_batch, 1)
-                    put_ok = True
-                except queue.Full:
-                    if self.terminate:
-                        break
+        while True:
+            for data_id in self.gen_task(self.dataset.batch_size * 8):
+                with self.dataset_weakdict_lock:
+                    dataset_dict = dict(self.dataset_weakdict)
+                yield loky.get_reusable_executor(
+                    initializer=_prefetch_setup, initargs=(dataset_dict, ),
+                    env=_prepare_worker_env(inner_max_num_threads=1),
+                ).submit(_process_one_data, id(self.dataset), data_id)
 
     def run(self):
-        count = 0
+        result_future_generator = self.loop_body()
+        result_future_queue = collections.deque()
         try:
+            for _ in range(self.dataset.batch_size):
+                result_future_queue.append(next(result_future_generator))
             while True:
-                if count == 1000:
-                    self.refresh_pool()
-                    count = 0
-                if self.terminate:
-                    print("break")
-                    break
-
-                self.loop_body()
-
-                count += 1
+                result_future_queue.append(next(result_future_generator))
+                yield result_future_queue[0].result()
+                result_future_queue.popleft()
         finally:
-            self.pool.close()
-            self.pool.join()
+            for result_future in result_future_queue:
+                result_future.cancel()
+            loky.wait(result_future_queue)
+            print("break")
+
+    def read(self):
+        return _concat_data(next(self.chunks(self.result_generator, self.dataset.batch_size)))
+
+    def close(self):
+        self.result_generator.close()
+        with self.dataset_weakdict_lock:
+            self.dataset_weakdict.pop(id(self.dataset))
 
 
 class _SimpleDatasetReader:
@@ -197,6 +215,9 @@ class _SimpleDatasetReader:
             image, label = _apply_augmentations(self.dataset, image, label)
             result.append((image, label))
         return _concat_data(result)
+
+    def close(self):
+        pass
 
 
 def _generate_tfds_map_func(dataset):
@@ -278,6 +299,9 @@ class _TFDSReader:
         ]
         return _concat_data(result)
 
+    def close(self):
+        self.session.close()
+
 
 class DatasetIterator:
 
@@ -295,9 +319,7 @@ class DatasetIterator:
             self.reader = _TFDSReader(self.dataset, local_rank)
         else:
             if self.enable_prefetch:
-                self.prefetch_result_queue = queue.Queue(maxsize=200)
-                self.prefetcher = _MultiProcessDatasetPrefetchThread(self.dataset, self.prefetch_result_queue, seed)
-                self.prefetcher.start()
+                self.reader = _MultiProcessDatasetReader(self.dataset, seed)
                 print("ENABLE prefetch")
             else:
                 self.reader = _SimpleDatasetReader(self.dataset, seed)
@@ -330,11 +352,7 @@ class DatasetIterator:
         return self
 
     def __next__(self):
-        if self.enable_prefetch:
-            (images, labels) = self.prefetch_result_queue.get()
-        else:
-            images, labels = self.reader.read()
-        return images, labels
+        return self.reader.read()
 
     def feed(self):
         return self.__next__()
@@ -358,36 +376,4 @@ class DatasetIterator:
         return random_indices
 
     def close(self):
-        if self.enable_prefetch:
-            self.prefetcher.terminate = True
-            self.prefetcher.pool.close()
-            self.prefetcher.pool.join()
-
-
-if __name__ == '__main__':
-
-    from blueoil.datasets.cifar10 import Cifar10
-    from blueoil.data_processor import Sequence
-    from blueoil.data_augmentor import FlipLeftRight, Hue, Blur
-
-    cifar10 = Cifar10()
-
-    augmentor = Sequence([
-        FlipLeftRight(0.5),
-        Hue((-10, 10)),
-        Blur(),
-    ])
-
-    dataset_iterator = DatasetIterator(dataset=cifar10, enable_prefetch=True, augmentor=augmentor)
-    time.sleep(2)
-    import time
-    t0 = time.time()
-    data_batch = next(dataset_iterator)
-    t1 = time.time()
-    print("time of prefetch: {}".format(t1 - t0))
-
-    dataset_iterator2 = DatasetIterator(dataset=cifar10, enable_prefetch=False, augmentor=augmentor)
-    t0 = time.time()
-    data_batch = next(dataset_iterator2)
-    t1 = time.time()
-    print("time with/o prefetch: {}".format(t1 - t0))
+        self.reader.close()

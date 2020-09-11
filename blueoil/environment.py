@@ -81,11 +81,13 @@ def init(experiment_id):
 
 def setup_test_environment():
     """Override `OUTPUT_DIR` and `DATA_DIR` for test."""
-    global DATA_DIR, _EXPERIMENT_DIR, _TENSORBOARD_DIR, _CHECKPOINTS_DIR
+    global DATA_DIR, OUTPUT_DIR, _EXPERIMENT_DIR, _TENSORBOARD_DIR, _CHECKPOINTS_DIR
 
     DATA_DIR = "unit/fixtures/datasets"
+    os.environ["DATA_DIR"] = DATA_DIR
 
     OUTPUT_DIR = "tmp/tests/saved"
+    os.environ["OUTPUT_DIR"] = OUTPUT_DIR
 
     _EXPERIMENT_DIR = os.path.join(OUTPUT_DIR, "{experiment_id}")
     _TENSORBOARD_DIR = os.path.join(OUTPUT_DIR, "{experiment_id}", "tensorboard")
@@ -94,13 +96,13 @@ def setup_test_environment():
 
 def teardown_test_environment():
     """Reset test environment."""
-    global DATA_DIR, _EXPERIMENT_DIR, _TENSORBOARD_DIR, _CHECKPOINTS_DIR
+    global DATA_DIR, OUTPUT_DIR, _EXPERIMENT_DIR, _TENSORBOARD_DIR, _CHECKPOINTS_DIR
 
     default_data_dir = "dataset"
-    DATA_DIR = os.getenv("DATA_DIR", default_data_dir)
+    DATA_DIR = default_data_dir
 
     default_output_dir = "saved"
-    OUTPUT_DIR = os.getenv("OUTPUT_DIR", default_output_dir)
+    OUTPUT_DIR = default_output_dir
 
     _EXPERIMENT_DIR = os.path.join(OUTPUT_DIR, "{experiment_id}")
     _TENSORBOARD_DIR = os.path.join(OUTPUT_DIR, "{experiment_id}", "tensorboard")

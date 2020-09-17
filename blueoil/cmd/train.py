@@ -280,6 +280,7 @@ def start_training(config, profile_step):
     # training loop end.
     train_dataset.close()
     validation_dataset.close()
+    sess.close()
     print("Done")
 
 

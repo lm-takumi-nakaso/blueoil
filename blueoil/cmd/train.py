@@ -165,7 +165,7 @@ def start_training(config, profile_step):
     executor.save_pb_file(sess, environment.CHECKPOINTS_DIR)
 
     if rank == 0:
-        train_writer = tf.compat.v1.summary.FileWriter(environment.TENSORBOARD_DIR + "/train", sess.graph)
+        train_writer = tf.compat.v1.summary.FileWriter(environment.TENSORBOARD_DIR + "/train")
         val_writer = tf.compat.v1.summary.FileWriter(environment.TENSORBOARD_DIR + "/validation")
 
         if config.IS_PRETRAIN:
@@ -184,6 +184,9 @@ def start_training(config, profile_step):
             train_writer.add_session_log(SessionLog(status=SessionLog.START), global_step=last_step + 1)
             val_writer.add_session_log(SessionLog(status=SessionLog.START), global_step=last_step + 1)
             print("recovered. last step", last_step)
+        else:
+            train_writer.add_graph(sess.graph)
+
 
     if use_horovod:
         # broadcast variables from rank 0 to all other processes
@@ -280,6 +283,7 @@ def start_training(config, profile_step):
     # training loop end.
     train_dataset.close()
     validation_dataset.close()
+    sess.close()
     print("Done")
 
 

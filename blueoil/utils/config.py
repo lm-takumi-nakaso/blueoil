@@ -17,6 +17,7 @@ import os
 import pprint
 from abc import ABCMeta
 
+import cloudpickle
 import yaml
 from blueoil.utils.smartdict import SmartDict
 from yaml.representer import Representer
@@ -64,7 +65,7 @@ REQUIEMNT_PARAMS_FOR_TRAINING = REQUIEMNT_PARAMS_FOR_INFERENCE + [
 def _saved_config_file_path():
     filepaths = [
         os.path.join(environment.EXPERIMENT_DIR, filename)
-        for filename in ('config.py', 'config.yaml')
+        for filename in ('config.py', 'config.yaml', 'config.pickle')
     ]
 
     for filepath in filepaths:
@@ -81,6 +82,8 @@ def _config_file_path_to_copy(config_file):
         filename = 'config.py'
     elif file_extension.lower() in ('.yml', '.yaml'):
         filename = 'config.yaml'
+    elif file_extension.lower() in ('.pkl', '.pickle'):
+        filename = 'config.pickle'
     else:
         raise ValueError('Config file type is not supported.'
                          'Should be .py, .yaml or .yml. Received {}.'.format(file_extension))
@@ -116,6 +119,8 @@ def load(config_file):
         loader = _load_py
     elif file_extension.lower() in ('.yml', '.yaml'):
         loader = _load_yaml
+    elif file_extension.lower() in ('.pkl', '.pickle'):
+        loader = _load_pickle
     else:
         raise ValueError('Config file type is not supported.'
                          'Should be .py, .yaml or .yml. Received {}.'.format(file_extension))
@@ -131,6 +136,18 @@ def _load_py(config_file):
     with file_io.File(config_file) as config_file_stream:
         source = config_file_stream.read()
         exec(source, globals(), config)
+
+    # use only upper key.
+    return SmartDict({
+        key: value
+        for key, value in config.items()
+        if key.isupper()
+    })
+
+
+def _load_pickle(config_file):
+    with file_io.File(config_file, mode="rb") as config_file_stream:
+        config = cloudpickle.load(config_file_stream)
 
     # use only upper key.
     return SmartDict({

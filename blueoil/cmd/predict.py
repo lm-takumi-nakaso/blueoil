@@ -14,7 +14,7 @@
 # limitations under the License.
 # =============================================================================
 import imghdr
-import math
+import itertools
 import os
 from glob import glob
 
@@ -30,35 +30,45 @@ from blueoil.utils.predict_output.writer import OutputWriter
 DUMMY_FILENAME = "DUMMY_FILE"
 
 
-def _get_images(filenames, pre_processor, data_format):
+def _get_images(image_inputs, start_index, pre_processor, data_format):
     images = []
     raw_images = []
+    image_files = []
 
-    for filename in filenames:
-        if filename == DUMMY_FILENAME:
-            raw_image = np.zeros((64, 64, 3), dtype=np.uint8)
+    for image_index, image_input in enumerate(image_inputs, start_index):
+        if image_input == DUMMY_FILENAME:
+            image_file = DUMMY_FILENAME
+            raw_image = np.zeros_like(raw_images[-1])
         else:
-            raw_image = load_image(filename)
-
+            try:
+                image_file = os.fspath(image_input)
+            except TypeError:
+                image_file = None
+            if image_file is not None:
+                raw_image = load_image(image_file)
+            else:
+                image_file = str(image_index)
+                raw_image = image_input
         image = pre_processor(image=raw_image)['image']
         if data_format == 'NCHW':
             image = np.transpose(image, [2, 0, 1])
 
         images.append(image)
         raw_images.append(raw_image)
+        image_files.append(image_file)
 
-    return np.array(images), np.array(raw_images)
+    return np.array(images), np.array(raw_images), image_files
 
 
 def _all_image_files(directory):
-    return [
+    return sorted((
         os.path.abspath(file_path)
         for file_path in glob(os.path.join(directory, "*"))
         if os.path.isfile(file_path) and imghdr.what(file_path) in {"jpeg", "png"}
-    ]
+    ))
 
 
-def _run(input_dir, output_dir, config, restore_path, save_images):
+def _run(inputs, output_dir, config, restore_path, save_images):
     ModelClass = config.NETWORK_CLASS
     network_kwargs = {key.lower(): val for key, val in config.NETWORK.items()}
 
@@ -84,9 +94,13 @@ def _run(input_dir, output_dir, config, restore_path, save_images):
     sess.run(init_op)
     saver.restore(sess, restore_path)
 
-    all_image_files = _all_image_files(input_dir)
-
-    step_size = int(math.ceil(len(all_image_files) / config.BATCH_SIZE))
+    try:
+        input_dir = os.fspath(inputs)
+    except TypeError:
+        input_dir = None
+    if input_dir is not None:
+        inputs = _all_image_files(input_dir)
+    image_input_iterator = iter(inputs)
 
     writer = OutputWriter(
         task=config.TASK,
@@ -96,18 +110,19 @@ def _run(input_dir, output_dir, config, restore_path, save_images):
     )
 
     results = []
-    for step in range(step_size):
+    for step in itertools.count():
         start_index = step * config.BATCH_SIZE
-        end_index = (step + 1) * config.BATCH_SIZE
 
-        image_files = all_image_files[start_index:end_index]
+        image_inputs = list(itertools.islice(image_input_iterator, config.BATCH_SIZE))
 
-        if len(image_files) < config.BATCH_SIZE:
+        if not (len(image_inputs) > 0):
+            break
+        if len(image_inputs) < config.BATCH_SIZE:
             # add dummy image.
-            image_files += [DUMMY_FILENAME] * (config.BATCH_SIZE - len(image_files))
+            image_inputs += [DUMMY_FILENAME] * (config.BATCH_SIZE - len(image_inputs))
 
-        images, raw_images = _get_images(
-            image_files, config.DATASET.PRE_PROCESSOR, config.DATA_FORMAT)
+        images, raw_images, image_files = _get_images(
+            image_inputs, start_index, config.DATASET.PRE_PROCESSOR, config.DATA_FORMAT)
 
         outputs = sess.run(output_op, feed_dict={images_placeholder: images})
 
@@ -118,17 +133,16 @@ def _run(input_dir, output_dir, config, restore_path, save_images):
 
         writer.write(output_dir, outputs, raw_images, image_files, step, save_material=save_images)
 
+    sess.close()
+
     return results
 
 
-def run(input_dir, output_dir, experiment_id, config_file, restore_path, save_images):
+def run(inputs, output_dir, experiment_id, config_file, restore_path, save_images):
     environment.init(experiment_id)
     config = config_util.load_from_experiment()
     if config_file:
         config = config_util.merge(config, config_util.load(config_file))
-
-    if not os.path.isdir(input_dir):
-        raise FileNotFoundError("Input directory not found: '{}'".format(input_dir))
 
     if restore_path is None:
         restore_file = search_restore_filename(environment.CHECKPOINTS_DIR)
@@ -141,7 +155,7 @@ def run(input_dir, output_dir, experiment_id, config_file, restore_path, save_im
 
     print("---- start predict ----")
 
-    _run(input_dir, output_dir, config, restore_path, save_images)
+    return _run(inputs, output_dir, config, restore_path, save_images)
 
     print("---- end predict ----")
 
@@ -158,4 +172,7 @@ def predict(input_dir, output_dir, experiment_id, config_file=None, checkpoint=N
         saved_dir = os.environ.get("OUTPUT_DIR", "saved")
         restore_path = os.path.join(saved_dir, experiment_id, "checkpoints", checkpoint)
 
-    run(input_dir, output_dir, experiment_id, config_file, restore_path, save_images)
+    if not os.path.isdir(input_dir):
+        raise FileNotFoundError("Input directory not found: '{}'".format(input_dir))
+
+    return run(input_dir, output_dir, experiment_id, config_file, restore_path, save_images)

@@ -156,6 +156,23 @@ def evaluate(config, restore_path, output_dir):
     }
     save_json(output_dir, json.dumps(metrics_dict, indent=4,), metrics_dict["last_step"])
     validation_dataset.close()
+    sess.close()
+
+    return metrics_dict
+
+
+def run(config_file, experiment_id, restore_path, output_dir):
+    environment.init(experiment_id)
+
+    config = config_util.load_from_experiment()
+
+    if config_file:
+        config = config_util.merge(config, config_util.load(config_file))
+
+    executor.init_logging(config)
+    config_util.display(config)
+
+    return evaluate(config, restore_path, output_dir)
 
 
 @click.command(context_settings=dict(help_option_names=["-h", "--help"]))
@@ -180,17 +197,7 @@ def evaluate(config, restore_path, output_dir):
     help="Output directory to save a evaluated result",
 )
 def main(config_file, experiment_id, restore_path, output_dir):
-    environment.init(experiment_id)
-
-    config = config_util.load_from_experiment()
-
-    if config_file:
-        config = config_util.merge(config, config_util.load(config_file))
-
-    executor.init_logging(config)
-    config_util.display(config)
-
-    evaluate(config, restore_path, output_dir)
+    run(config_file, experiment_id, restore_path, output_dir)
 
 
 if __name__ == "__main__":
